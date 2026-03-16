@@ -1,5 +1,17 @@
 # What's New?
 
+## v4.2.0
+
+### New Features
+
+- **`resume` command improvements**: the `resume` command now uses an optimized
+  thread discovery strategy when `-threads` is enabled. It queries the database
+  for threads with recent activity (new replies within the lookback window),
+  catching ongoing conversations in old threads that would otherwise be missed.
+  Uses `RunNoTransform` for better performance by skipping unnecessary
+  transformation overhead. See `slackdump help resume` for details on
+  limitations.
+
 ## v4.1.0
 
 ### New Features

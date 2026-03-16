@@ -337,7 +337,7 @@ func Test_usersTeam(t *testing.T) {
 	}
 }
 
-func Test_latest(t *testing.T) {
+func Test_latestWithDB(t *testing.T) {
 	type args struct {
 		ctx context.Context
 		// src source.Resumer
@@ -396,7 +396,7 @@ func Test_latest(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "returns latest status with thread",
+			name: "threads are skipped when db is nil even if includeThreads is true",
 			args: args{
 				ctx:            t.Context(),
 				includeThreads: true,
@@ -408,14 +408,14 @@ func Test_latest(t *testing.T) {
 					{Channel: "C456", ThreadTS: "123.456"}: time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC),
 				}, nil)
 			},
+			// Threads are skipped when db is nil - only channels are returned
 			want: structures.NewEntityListFromItems(
 				structures.EntityItem{Id: "C123", Oldest: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC), Latest: time.Time(cfg.Latest), Include: true},
-				structures.EntityItem{Id: "C456:123.456", Oldest: time.Date(2021, 1, 2, 0, 0, 0, 0, time.UTC), Latest: time.Time(cfg.Latest), Include: true},
 			),
 			wantErr: false,
 		},
 		{
-			name: "returns latest status with thread, but includeThreads is false",
+			name: "threads are skipped when includeThreads is false",
 			args: args{
 				ctx:            t.Context(),
 				includeThreads: false,
@@ -440,9 +440,9 @@ func Test_latest(t *testing.T) {
 			if tt.expectFn != nil {
 				tt.expectFn(mr)
 			}
-			got, err := latest(tt.args.ctx, mr, tt.args.includeThreads, tt.args.lookBack, tt.args.other)
+			got, err := latestWithDB(tt.args.ctx, mr, nil, tt.args.includeThreads, tt.args.lookBack, tt.args.other)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("latest() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("latestWithDB() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			assert.Equal(t, tt.want, got)

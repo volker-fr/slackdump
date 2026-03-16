@@ -25,6 +25,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/sosodev/duration"
 
 	"github.com/rusq/slackdump/v4"
@@ -109,7 +110,16 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		return fmt.Errorf("source type %q does not support resume, use 'slackdump convert -f database' to convert it", src.Type())
 	}
 
-	latest, err := latest(ctx, src, resumeFlags.IncludeThreads, time.Duration((*duration.Duration)(resumeFlags.Lookback).ToTimeDuration()), list)
+	// OPTIMIZATION: Open database early so we can query for threads with recent activity
+	// connecting to the database in read-write mode.
+	wconn, _, err := bootstrap.Database(dir, cmd.Name())
+	if err != nil {
+		base.SetExitStatus(base.SInitializationError)
+		return fmt.Errorf("error opening database: %w", err)
+	}
+	defer wconn.Close()
+
+	latest, err := latestWithDB(ctx, src, wconn, resumeFlags.IncludeThreads, time.Duration((*duration.Duration)(resumeFlags.Lookback).ToTimeDuration()), list)
 	if err != nil {
 		base.SetExitStatus(base.SApplicationError)
 		return fmt.Errorf("error loading latest timestamps: %w", err)
@@ -138,14 +148,7 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		return fmt.Errorf("error closing source: %w", err)
 	}
 
-	// connecting to the database in read-write mode.
-	wconn, _, err := bootstrap.Database(dir, cmd.Name())
-	if err != nil {
-		base.SetExitStatus(base.SInitializationError)
-		return fmt.Errorf("error opening database: %w", err)
-	}
-	defer wconn.Close()
-
+	// Database already opened earlier for thread activity query (wconn)
 	cf := control.Flags{
 		Refresh:       resumeFlags.Refresh,
 		ChannelUsers:  cfg.OnlyChannelUsers,
@@ -162,7 +165,9 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 	}
 	defer ctrl.Close()
 
-	if err := ctrl.Run(ctx, latest); err != nil {
+	// OPTIMIZATION: Resume just fetches new data and appends to the database.
+	// It doesn't need the transformation/completion tracking overhead that export requires.
+	if err := ctrl.RunNoTransform(ctx, latest); err != nil {
 		base.SetExitStatus(base.SApplicationError)
 		return fmt.Errorf("error running archive controller: %w", err)
 	}
@@ -170,7 +175,8 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 	return nil
 }
 
-func latest(ctx context.Context, src source.Resumer, includeThreads bool, lookBack time.Duration, other *structures.EntityList) (*structures.EntityList, error) {
+// latestWithDB loads latest timestamps and optionally queries DB for threads with recent activity.
+func latestWithDB(ctx context.Context, src source.Resumer, db *sqlx.DB, includeThreads bool, lookBack time.Duration, other *structures.EntityList) (*structures.EntityList, error) {
 	if lookBack > 0 {
 		lookBack = -lookBack
 	}
@@ -186,9 +192,18 @@ func latest(ctx context.Context, src source.Resumer, includeThreads bool, lookBa
 		strlatest(latest)
 	}
 
+	// OPTIMIZATION: Only load channels from Latest(), not threads.
+	// Threads will be discovered either:
+	// 1. From channel messages in lookback window (new thread parent messages)
+	// 2. From DB query for threads with LATEST_REPLY in lookback window (old threads with new replies)
+	oldestCutoff := time.Now().UTC().Add(lookBack)
+
 	ei := make([]structures.EntityItem, 0, len(latest))
 	for sl, ts := range latest {
-		if sl.IsThread() && !includeThreads {
+		if sl.IsThread() {
+			// Skip threads from Latest() - we'll add active ones below
+			// when we collect all messages in the lookback window,
+			// where we'll discover new threads from those messages.
 			continue
 		}
 		item := structures.EntityItem{
@@ -200,10 +215,79 @@ func latest(ctx context.Context, src source.Resumer, includeThreads bool, lookBa
 		ei = append(ei, item)
 		debugprint(fmt.Sprintf("%s: %d->%d", item.Id, ts.UTC().UnixMicro(), item.Oldest.UnixMicro()))
 	}
+
+	// If threads are enabled query DB for threads with recent activity.
+	// This catches old threads that got new replies within the lookback window.
+	// Without this, threads are only discovered from channel messages
+	// (faster but may miss old threads with new replies).
+	// While this is still not perfect and will miss new threads in channel messages
+	// older than the lookback window, it catches long ongoing threads that still
+	// had recent activity.
+	if includeThreads && db != nil {
+		activeThreads, err := getActiveThreads(ctx, db, oldestCutoff)
+		if err != nil {
+			// Log but don't fail - we'll still get threads from channel message discovery
+			slog.Warn("failed to query active threads", "error", err)
+		} else {
+			for _, sl := range activeThreads {
+				// Add thread with same lookback as channels
+				item := structures.EntityItem{
+					Id:      sl.String(),
+					Oldest:  oldestCutoff,
+					Latest:  time.Time(cfg.Latest),
+					Include: true,
+				}
+				ei = append(ei, item)
+				debugprint(fmt.Sprintf("thread %s (active): %d->%d", item.Id, oldestCutoff.UnixMicro(), item.Oldest.UnixMicro()))
+			}
+		}
+	}
+
 	el := structures.NewEntityListFromItems(ei...)
 	el.Overlay(other)
 
 	return el, nil
+}
+
+// getActiveThreads queries the database for threads with LATEST_REPLY >= oldestCutoff.
+// This finds threads where the parent is old but got a new reply recently.
+func getActiveThreads(ctx context.Context, db *sqlx.DB, oldestCutoff time.Time) ([]structures.SlackLink, error) {
+	// Query for threads (IS_PARENT = 1) with LATEST_REPLY in the lookback window
+	// LATEST_REPLY is stored as TEXT in Slack timestamp format (e.g., "1234567890.123456")
+	// We need to convert it to compare with our cutoff
+	query := `
+		SELECT DISTINCT CHANNEL_ID, THREAD_TS
+		FROM MESSAGE
+		WHERE IS_PARENT = 1
+		  AND LATEST_REPLY IS NOT NULL
+		  AND LATEST_REPLY != ''
+		  AND CAST(LATEST_REPLY AS REAL) >= ?
+	`
+	// Convert time to Slack timestamp format (seconds since epoch with microseconds)
+	cutoffTs := fmt.Sprintf("%d.%06d", oldestCutoff.Unix(), oldestCutoff.Nanosecond()/1000)
+
+	rows, err := db.QueryContext(ctx, query, cutoffTs)
+	if err != nil {
+		return nil, fmt.Errorf("query active threads: %w", err)
+	}
+	defer rows.Close()
+
+	var threads []structures.SlackLink
+	for rows.Next() {
+		var channelID, threadTS string
+		if err := rows.Scan(&channelID, &threadTS); err != nil {
+			return nil, fmt.Errorf("scan thread row: %w", err)
+		}
+		threads = append(threads, structures.SlackLink{
+			Channel:  channelID,
+			ThreadTS: threadTS,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate thread rows: %w", err)
+	}
+
+	return threads, nil
 }
 
 func debugprint(a ...any) {
