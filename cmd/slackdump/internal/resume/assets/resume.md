@@ -47,6 +47,56 @@ slackdump resume -refresh -member-only <archive>
 The membership filter applies to newly discovered channels. Channels already
 in the resume list are still processed, even if you are no longer a member.
 
+### Discovering thread activity with Slack search.
+
+```plaintext
+slackdump resume --search-thread <archive>
+slackdump resume --search-thread -lookback p28d <archive>
+```
+
+`--search-thread` replaces ordinary thread polling for archived and explicitly
+included channels with discovery through Slack's `is:thread` search. It takes
+precedence over `-threads`. The UTC start is inclusive. Set it with `-time-from`
+or let Slackdump use the earliest channel resume start in the search scope.
+For an archived channel, the resume start is the timestamp of its latest
+message from a completed history fetch, minus `-lookback` (seven days by
+default). Specifying a channel on the command line replaces its archived resume
+start with the date you supply, if any. Channels without a date share the search
+window. If the scope has channels but none has a date, supply `-time-from`.
+The UTC `-time-to` is exclusive and defaults to the time Slackdump started.
+
+Slackdump searches the full window and splits at UTC midnight boundaries when
+the first page reports at least 10,000 matches or 100 pages. Reaching page 100
+also triggers a split as a precaution for the hypothetical case where Slack
+clips results and understates the first-page counts. If a capped window has
+no interior UTC midnight, discovery fails. Slackdump filters hits by their
+exact timestamp. A reply in the window can lead to a parent older than the
+window.
+Discovered threads are fetched from the parent through the exclusive end.
+
+Channel history and canvas discussions still resume. Channel exclusions and
+`-skip-stale-channels` limit discovery. An explicit channel can override the
+stale filter. For channel history, `-time-from` serves as a fallback for
+channels without their own start. Threads specified by link retain their usual
+bounds and `-skip-complete-threads` policy. Search-discovered roots bypass
+`-skip-complete-threads` and `-skip-stale-threads`. Channels added by
+`-refresh` outside the initial search scope use ordinary history-based thread
+discovery. This includes channels that `-refresh` adds back after the stale
+channel filter skipped them.
+
+Choose a start with overlap to account for indexing delays. Use the same explicit
+bounds to replay a failed run.
+
+```plaintext
+slackdump resume --search-thread -time-from 2026-11-12T00:00:00 \
+  -time-to 2026-11-19T00:00:00 <archive>
+```
+
+Search discovery runs before the archive session starts. A failed fetch for a
+search-discovered thread leaves the session unfinished. Slackdump stores no
+search checkpoint. Search coverage depends on Slack indexing, visibility, and
+retention and may miss edits or deletions.
+
 ### Deduplicating resume overlap.
 
 Resume uses a lookback window to avoid missing edits, replies, and other

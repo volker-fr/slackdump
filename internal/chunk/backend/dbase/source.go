@@ -419,6 +419,46 @@ func (s *Source) Latest(ctx context.Context) (map[structures.SlackLink]time.Time
 	return m, nil
 }
 
+// ResumeChannelHistory returns all ordinary history channels, including empty
+// and unfinished channels. A nonzero timestamp is backed by a finished
+// session in which the channel's history reached its final page.
+func (s *Source) ResumeChannelHistory(ctx context.Context) (map[string]time.Time, error) {
+	const stmt = `
+WITH HISTORY AS (
+    SELECT DISTINCT CHANNEL_ID FROM CHUNK WHERE TYPE_ID = ? AND CHANNEL_ID IS NOT NULL
+), COMPLETE AS (
+    SELECT DISTINCT C.CHANNEL_ID, C.SESSION_ID
+    FROM CHUNK C JOIN SESSION S ON S.ID = C.SESSION_ID
+    WHERE C.TYPE_ID = ? AND C.FINAL AND S.FINISHED
+)
+SELECT H.CHANNEL_ID, MAX(M.ID)
+FROM HISTORY H
+LEFT JOIN COMPLETE F ON F.CHANNEL_ID = H.CHANNEL_ID
+LEFT JOIN CHUNK C ON C.CHANNEL_ID = F.CHANNEL_ID AND C.SESSION_ID = F.SESSION_ID AND C.TYPE_ID = ?
+LEFT JOIN MESSAGE M ON M.CHUNK_ID = C.ID AND M.CHANNEL_ID = C.CHANNEL_ID
+GROUP BY H.CHANNEL_ID`
+	rows, err := s.conn.QueryContext(ctx, stmt, chunk.CMessages, chunk.CMessages, chunk.CMessages)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	history := make(map[string]time.Time)
+	for rows.Next() {
+		var channelID string
+		var id sql.NullInt64
+		if err := rows.Scan(&channelID, &id); err != nil {
+			return nil, err
+		}
+		var latest time.Time
+		if id.Valid {
+			latest = fasttime.Int2Time(id.Int64)
+		}
+		history[channelID] = latest
+	}
+	return history, rows.Err()
+}
+
 func (src *Source) ToChunk(ctx context.Context, e chunk.Encoder, sessID int64) error {
 	if sessID < 1 {
 		return ErrInvalidSessionID

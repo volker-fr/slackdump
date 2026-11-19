@@ -129,7 +129,8 @@ func (cs *Stream) Conversations(ctx context.Context, proc processor.Conversation
 		}
 		if err := res.Err; err != nil {
 			trace.Logf(ctx, "error", "type: %s, chan_id: %s, thread_ts: %s, error: %s", res.Type, res.ChannelID, res.ThreadTS, err.Error())
-			if (errors.Is(err, errChanNotFound) || errors.Is(err, errNotInChannel)) && !cs.failChnlNotFnd {
+			strict := res.Type == RTThread && cs.isSearchThread(res.ChannelID, res.ThreadTS)
+			if !strict && !cs.failChnlNotFnd && (errors.Is(err, errChanNotFound) || errors.Is(err, errNotInChannel)) {
 				slog.WarnContext(ctx, "channel not found or user not in channel, skipping", "channel_id", res.ChannelID)
 				continue
 			}
@@ -266,6 +267,7 @@ type threadFetchSpec struct {
 	threadTS  string
 	oldest    time.Time
 	latest    time.Time
+	strict    bool
 }
 
 type ordinaryThreadRequest struct {
@@ -378,6 +380,10 @@ func (cs *Stream) paginateThread(ctx context.Context, spec threadFetchSpec, call
 	lg.DebugContext(ctx, "- getting thread")
 
 	var cursor string
+	var seen map[string]struct{}
+	if spec.strict {
+		seen = make(map[string]struct{})
+	}
 	for {
 		var (
 			msgs       []slack.Message
@@ -395,7 +401,7 @@ func (cs *Stream) paginateThread(ctx context.Context, spec threadFetchSpec, call
 				Latest:    structures.FormatSlackTS(structures.NVLTime(spec.latest, cs.latest)),
 				Inclusive: cs.inclusive,
 			})
-			if apiErr == nil && len(msgs) == 0 {
+			if apiErr == nil && len(msgs) == 0 && !spec.strict {
 				lg.DebugContext(ctx, "  - no messages returned by the API, requesting a retry")
 				// no messages returned by the API, but no error either, let's ask
 				// nicely to retry, maybe Slack is having a bad day.
@@ -408,6 +414,23 @@ func (cs *Stream) paginateThread(ctx context.Context, spec threadFetchSpec, call
 			return apiErr
 		}, network.RetryReadOnly); err != nil {
 			return newAPIError("conversations.replies", err)
+		}
+
+		if spec.strict {
+			if hasmore && nextCursor == "" {
+				return newAPIError("conversations.replies", errors.New("more replies reported without a next cursor"))
+			}
+			if _, exists := seen[nextCursor]; exists {
+				return newAPIError("conversations.replies", errors.New("repeated replies cursor"))
+			}
+			if nextCursor != "" {
+				seen[nextCursor] = struct{}{}
+				hasmore = true
+				if len(msgs) == 0 {
+					cursor = nextCursor
+					continue
+				}
+			}
 		}
 
 		r := trace.StartRegion(ctx, "thread_callback")
@@ -451,13 +474,14 @@ func parentOnlyThreadMessages(spec threadFetchSpec, parent *slack.Message) []sla
 // error if any.
 func (cs *Stream) procChanMsg(ctx context.Context, proc processor.Conversations, threadC chan<- ordinaryThreadRequest, channel *slack.Channel, isLast bool, mm []slack.Message) (int, error) {
 	trs := make([]ordinaryThreadRequest, 0, len(mm))
+	_, searchHistory := cs.searchHistoryChannels[channel.ID]
 	for i := range mm {
 		// collecting threads to get their count.  But we don't start
 		// processing them yet, before we send the messages with the number of
 		// "expected" threads to processor, to ensure that processor will
 		// start processing the channel and will have the initial reference
 		// count, if it needs it.
-		if mm[i].ThreadTimestamp != "" && mm[i].SubType != structures.SubTypeThreadBroadcast && mm[i].LatestReply != structures.LatestReplyNoReplies {
+		if !searchHistory && mm[i].ThreadTimestamp != "" && mm[i].SubType != structures.SubTypeThreadBroadcast && mm[i].LatestReply != structures.LatestReplyNoReplies {
 			if cs.skipThread != nil && cs.skipThread(ctx, channel.ID, mm[i].ThreadTimestamp, mm[i].ReplyCount) {
 				slog.DebugContext(ctx, "skipping complete thread", "channel_id", channel.ID, "thread_ts", mm[i].ThreadTimestamp, "reply_count", mm[i].ReplyCount)
 				continue

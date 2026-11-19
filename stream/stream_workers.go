@@ -98,6 +98,11 @@ func (cs *Stream) channelWorker(ctx context.Context, proc processor.Conversation
 	}
 }
 
+func (cs *Stream) isSearchThread(channelID, threadTS string) bool {
+	_, ok := cs.searchThreadRoots[structures.SlackLink{Channel: channelID, ThreadTS: threadTS}]
+	return ok
+}
+
 func (cs *Stream) threadWorker(ctx context.Context, proc processor.Conversations, results chan<- Result, threadReq <-chan ordinaryThreadRequest) {
 	ctx, task := trace.NewTask(ctx, "threadWorker")
 	defer task.End()
@@ -137,9 +142,22 @@ func (cs *Stream) threadWorker(ctx context.Context, proc processor.Conversations
 				// already fetched by channelWorker, so we just need the ID.
 				channel.ID = req.fetch.channelID
 			}
+			req.fetch.strict = req.threadOnly && cs.isSearchThread(req.fetch.channelID, req.fetch.threadTS)
 			firstPage := true
+			var parent slack.Message
 			err := cs.paginateThread(ctx, req.fetch, func(msgs []slack.Message, isLast bool) (bool, error) {
-				if firstPage && req.threadOnly && cs.skipThread != nil && cs.skipThread(ctx, req.fetch.channelID, req.fetch.threadTS, msgs[0].ReplyCount) {
+				if req.fetch.strict {
+					var err error
+					msgs, err = prepareSearchThreadPage(req.fetch, &parent, msgs)
+					if err != nil {
+						return false, err
+					}
+					if firstPage {
+						if err := procFiles(ctx, proc, channel, parent); err != nil {
+							return false, err
+						}
+					}
+				} else if firstPage && req.threadOnly && cs.skipThread != nil && cs.skipThread(ctx, req.fetch.channelID, req.fetch.threadTS, msgs[0].ReplyCount) {
 					slog.DebugContext(ctx, "skipping complete thread", "channel_id", req.fetch.channelID, "thread_ts", req.fetch.threadTS, "reply_count", msgs[0].ReplyCount)
 					return false, nil
 				}
@@ -153,7 +171,7 @@ func (cs *Stream) threadWorker(ctx context.Context, proc processor.Conversations
 				return true, nil
 			})
 			if err != nil {
-				if errors.Is(err, errThreadNotFound) {
+				if !req.fetch.strict && errors.Is(err, errThreadNotFound) {
 					slog.WarnContext(ctx, "skipping non-existing thread", "channel_id", req.fetch.channelID, "thread_ts", req.fetch.threadTS)
 					err = procThreadMsg(ctx, proc, channel, req.fetch.threadTS, req.threadOnly, true, parentOnlyThreadMessages(req.fetch, req.parent))
 					if err == nil {
@@ -169,6 +187,42 @@ func (cs *Stream) threadWorker(ctx context.Context, proc processor.Conversations
 			}
 		}
 	}
+}
+
+// prepareSearchThreadPage uses the parent from the first nonempty page as the
+// header on every page, including an empty final page.
+func prepareSearchThreadPage(spec threadFetchSpec, parent *slack.Message, msgs []slack.Message) ([]slack.Message, error) {
+	if len(msgs) == 0 {
+		if parent.Timestamp == "" {
+			return nil, fmt.Errorf("replies ended without parent %s", spec.threadTS)
+		}
+		return []slack.Message{*parent}, nil
+	}
+	if parent.Timestamp == "" && msgs[0].Timestamp != spec.threadTS {
+		return nil, fmt.Errorf("first replies page does not begin with parent %s", spec.threadTS)
+	}
+	if msgs[0].Timestamp == spec.threadTS {
+		root := msgs[0]
+		if (root.ThreadTimestamp != "" && root.ThreadTimestamp != spec.threadTS) ||
+			(root.Channel != "" && root.Channel != spec.channelID) {
+			return nil, fmt.Errorf("invalid replies parent %s", root.Timestamp)
+		}
+		if parent.Timestamp == "" {
+			root.ThreadTimestamp = spec.threadTS
+			*parent = root
+		}
+		msgs[0] = *parent
+	} else {
+		msgs = append([]slack.Message{*parent}, msgs...)
+	}
+	for _, msg := range msgs[1:] {
+		ts, err := structures.ParseCanonicalSlackTS(msg.Timestamp)
+		if err != nil || msg.ThreadTimestamp != spec.threadTS || !ts.After(spec.oldest.Add(time.Microsecond)) ||
+			!ts.Before(spec.latest) || (msg.Channel != "" && msg.Channel != spec.channelID) {
+			return nil, fmt.Errorf("invalid reply %q for thread %s", msg.Timestamp, spec.threadTS)
+		}
+	}
+	return msgs, nil
 }
 
 func (cs *Stream) processCanvasThread(ctx context.Context, proc processor.Conversations, req canvasThreadRequest) error {

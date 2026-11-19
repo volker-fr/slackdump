@@ -77,7 +77,7 @@ func TestDBControllerFileDeduplicationOption(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := dbControllerFiler(fileproc.NoopDownloader{}, nil, nil, tt.opts)
+			got := dbControllerFiler(fileproc.NoopDownloader{}, nil, "", nil, tt.opts)
 			tt.want(t, got)
 		})
 	}

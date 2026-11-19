@@ -328,7 +328,18 @@ func buildPrunableChunksSelect(entity dedupeEntity) string {
 	}
 	buf.WriteString("\nWHERE C.TYPE_ID IN (")
 	buf.WriteString(strings.Join(placeholders(entity.chunkTypes), ","))
-	buf.WriteString(")\nGROUP BY C.ID\nHAVING COUNT(T.CHUNK_ID) > 0 AND COUNT(T.CHUNK_ID) = COUNT(D.CHUNK_ID)")
+	buf.WriteString(")\n")
+	if entity.etype == entMessages {
+		// Final pages mark completion. A channel without one still needs a
+		// history chunk to be included in resume, even if its payload is gone.
+		fmt.Fprintf(&buf, `AND (C.TYPE_ID <> %[1]d OR (NOT C.FINAL AND C.ID NOT IN (
+    SELECT MAX(ID) FROM CHUNK
+    WHERE TYPE_ID = %[1]d AND CHANNEL_ID IS NOT NULL
+    GROUP BY CHANNEL_ID HAVING NOT MAX(FINAL <> 0)
+)))
+`, chunk.CMessages)
+	}
+	buf.WriteString("GROUP BY C.ID\nHAVING COUNT(T.CHUNK_ID) > 0 AND COUNT(T.CHUNK_ID) = COUNT(D.CHUNK_ID)")
 	return buf.String()
 }
 
@@ -347,7 +358,34 @@ func buildDeleteDuplicatesStmt(entity dedupeEntity) string {
 
 func withDuplicateRows(entity dedupeEntity, final string) string {
 	var buf strings.Builder
-	buf.WriteString("WITH latest AS (\n")
+	buf.WriteString("WITH ")
+	if entity.etype == entMessages || entity.etype == entCanvasMessages {
+		// Each completed history channel needs its newest message for the
+		// resume cutoff. Either MESSAGE pass can otherwise delete that row.
+		fmt.Fprintf(&buf, `complete_channels AS (
+    SELECT DISTINCT F.CHANNEL_ID
+    FROM CHUNK F JOIN SESSION S ON S.ID = F.SESSION_ID
+    WHERE F.TYPE_ID = %[1]d AND F.FINAL AND S.FINISHED AND F.CHANNEL_ID IS NOT NULL
+),
+resume_cutoffs AS MATERIALIZED (
+    SELECT (
+        SELECT M.ROWID
+        FROM MESSAGE M
+        JOIN CHUNK C ON C.ID = M.CHUNK_ID AND C.CHANNEL_ID = M.CHANNEL_ID
+        JOIN SESSION S ON S.ID = C.SESSION_ID
+        WHERE M.CHANNEL_ID = H.CHANNEL_ID AND C.TYPE_ID = %[1]d AND S.FINISHED
+        AND EXISTS (
+            SELECT 1 FROM CHUNK F
+            WHERE F.CHANNEL_ID = C.CHANNEL_ID AND F.SESSION_ID = C.SESSION_ID
+            AND F.TYPE_ID = %[1]d AND F.FINAL
+        )
+        ORDER BY M.ID DESC, M.CHUNK_ID DESC LIMIT 1
+    ) AS MESSAGE_ROW_ID
+    FROM complete_channels H
+),
+`, chunk.CMessages)
+	}
+	buf.WriteString("latest AS (\n")
 	buf.WriteString("SELECT ")
 	buf.WriteString(selectAliasedColumns("T", entity.keyColumns))
 	if entity.mode == dedupeByData {
@@ -375,7 +413,11 @@ func withDuplicateRows(entity dedupeEntity, final string) string {
 	if entity.mode == dedupeByData {
 		buf.WriteString(" AND L.DATA = T.DATA")
 	}
-	buf.WriteString("\nWHERE T.CHUNK_ID < L.KEEP_CHUNK_ID\n)\n")
+	buf.WriteString("\nWHERE T.CHUNK_ID < L.KEEP_CHUNK_ID\n")
+	if entity.etype == entMessages || entity.etype == entCanvasMessages {
+		buf.WriteString("AND T.ROWID NOT IN (SELECT MESSAGE_ROW_ID FROM resume_cutoffs WHERE MESSAGE_ROW_ID IS NOT NULL)\n")
+	}
+	buf.WriteString(")\n")
 	buf.WriteString(final)
 	return buf.String()
 }

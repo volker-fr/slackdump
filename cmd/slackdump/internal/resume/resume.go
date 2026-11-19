@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -36,6 +35,7 @@ import (
 	"github.com/rusq/slackdump/v4/cmd/slackdump/internal/golang/base"
 	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase"
 	"github.com/rusq/slackdump/v4/internal/chunk/control"
+	"github.com/rusq/slackdump/v4/internal/client"
 	"github.com/rusq/slackdump/v4/internal/structures"
 	"github.com/rusq/slackdump/v4/source"
 	"github.com/rusq/slackdump/v4/stream"
@@ -62,14 +62,15 @@ type ResumeParams struct {
 	// IncludeThreads includes scanning of the threads in the archive
 	// and checking if there are any new messages in them.
 	IncludeThreads bool
+	// SearchThread discovers thread roots from hits in the requested window
+	// instead of polling ordinary stored threads.
+	SearchThread bool
 	// RecordOnlyNewUsers if set to false (default), records only updated or
 	// new users. If set to true, records all users from the workspace again,
 	// not just changed.
 	RecordOnlyNewUsers bool
-	// Lookback specifies the lookback parameter. The "oldest" timestamp for
-	// API requests will be set to Now()-Lookback.  This is required to capture
-	// new threads on historical messages, otherwise, new threads on old messages
-	// will not be fetched.
+	// Lookback moves each stored resume timestamp backward to cover activity
+	// on recently archived messages.
 	Lookback *extDuration
 	// SkipCompleteThreads skips threads where the database already holds all
 	// replies (DB count == API reply_count + 1).  Faster, but won't detect
@@ -99,11 +100,9 @@ var resumeFlags = ResumeParams{
 func init() {
 	CmdResume.Run = runResume
 	CmdResume.Flag.BoolVar(&resumeFlags.Refresh, "refresh", false, "refresh the list of channels")
-	CmdResume.Flag.BoolVar(&resumeFlags.IncludeThreads, "threads", false, "include threads (slow, and flaky business)")
+	registerThreadFlags()
 	CmdResume.Flag.BoolVar(&resumeFlags.RecordOnlyNewUsers, "only-new-users", true, "record only new or updated users")
 	CmdResume.Flag.Var(resumeFlags.Lookback, "lookback", "lookback window `duration`")
-	CmdResume.Flag.BoolVar(&resumeFlags.SkipCompleteThreads, "skip-complete-threads", false, "skip threads where DB already has all replies (faster, but won't detect edits/deletes)")
-	CmdResume.Flag.Var(resumeFlags.SkipStaleThreads, "skip-stale-threads", "skip thread entities whose latest reply is older than this `duration` (default: disabled)")
 	CmdResume.Flag.Var(resumeFlags.SkipStaleChannels, "skip-stale-channels", "skip channel entities whose latest message is older than this `duration` (default: disabled; pair with a periodic full-sweep run)")
 	CmdResume.Flag.BoolVar(&resumeFlags.Dedupe, "dedupe", false, "run dedupe cleanup after successful resume finish")
 }
@@ -123,6 +122,10 @@ type archiveRunner interface {
 }
 
 func runResume(ctx context.Context, cmd *base.Command, args []string) error {
+	return runResumeWithClient(ctx, cmd, args, bootstrap.Slack)
+}
+
+func runResumeWithClient(ctx context.Context, cmd *base.Command, args []string, newClient func(context.Context, ...client.Option) (client.Slack, error)) error {
 	if len(args) < 1 {
 		base.SetExitStatus(base.SInvalidParameters)
 		return errors.New("expected at least one argument")
@@ -148,23 +151,61 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		return fmt.Errorf("source type %q does not support resume, use 'slackdump convert -f database' to convert it", src.Type())
 	}
 
-	threadCutoff := computeCutoff(resumeFlags.SkipStaleThreads)
+	lookback := time.Duration((*duration.Duration)(resumeFlags.Lookback).ToTimeDuration())
 	channelCutoff := computeCutoff(resumeFlags.SkipStaleChannels)
-	latestResult, err := latest(ctx, src, resumeFlags.IncludeThreads, resumeFlags.SkipCompleteThreads, time.Duration((*duration.Duration)(resumeFlags.Lookback).ToTimeDuration()), threadCutoff, channelCutoff, list)
+	var result latestResult
+	var searchChannels map[string]struct{}
+	var inferredStart time.Time
+	if resumeFlags.SearchThread {
+		historySource, ok := src.(interface {
+			ResumeChannelHistory(context.Context) (map[string]time.Time, error)
+		})
+		if !ok {
+			base.SetExitStatus(base.SApplicationError)
+			return errors.New("archive does not support channel history resume")
+		}
+		var history map[string]time.Time
+		history, err = historySource.ResumeChannelHistory(ctx)
+		result, searchChannels, inferredStart = searchThreadChannels(history, lookback, channelCutoff, list)
+	} else {
+		threadCutoff := computeCutoff(resumeFlags.SkipStaleThreads)
+		result, err = latest(ctx, src, resumeFlags.IncludeThreads, resumeFlags.SkipCompleteThreads, lookback, threadCutoff, channelCutoff, list)
+	}
 	if err != nil {
 		base.SetExitStatus(base.SApplicationError)
 		return fmt.Errorf("error loading latest timestamps: %w", err)
 	}
-	switch decideResume(latestResult) {
+	decision := decideResume(result)
+	if resumeFlags.SearchThread {
+		decision = decideSearchResume(result, resumeFlags.Refresh)
+	}
+	switch decision {
 	case resumeDecisionInvalidArchive:
 		base.SetExitStatus(base.SInvalidParameters)
+		if resumeFlags.SearchThread {
+			return fmt.Errorf("archive %s has no ordinary channel history; specify a channel or a thread to resume", dir)
+		}
 		return fmt.Errorf("the archive does not contain any data: %s", dir)
 	case resumeDecisionNoop:
-		cfg.Log.InfoContext(ctx, "all resume entities were skipped by stale filters", "database", dir, "skipped", latestResult.skippedStale)
+		if resumeFlags.SearchThread {
+			cfg.Log.InfoContext(ctx, "no channels or explicit threads to resume", "database", dir, "skipped_stale", result.skippedStale)
+		} else {
+			cfg.Log.InfoContext(ctx, "all resume entities were skipped by stale filters", "database", dir, "skipped", result.skippedStale)
+		}
 		return nil
 	}
 
-	client, err := bootstrap.Slack(ctx)
+	var searchWindow searchThreadWindow
+	if len(searchChannels) > 0 {
+		start := structures.NVLTime(time.Time(cfg.Oldest), inferredStart)
+		searchWindow, err = newSearchThreadWindow(start, time.Time(cfg.Latest))
+		if err != nil {
+			base.SetExitStatus(base.SInvalidParameters)
+			return err
+		}
+	}
+
+	client, err := newClient(ctx)
 	if err != nil {
 		base.SetExitStatus(base.SInitializationError)
 		return fmt.Errorf("error creating slackdump session: %w", err)
@@ -181,10 +222,25 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		return fmt.Errorf("error ensuring the same workspace: %w", err)
 	}
 
+	archiveDir := src.Name()
 	// closing off the sourcer, as we don't need it anymore.
 	if err := src.Close(); err != nil {
 		base.SetExitStatus(base.SApplicationError)
 		return fmt.Errorf("error closing source: %w", err)
+	}
+
+	// Discovery must finish before DBController opens a new archive session.
+	var searchOpt stream.Option
+	if resumeFlags.SearchThread {
+		if len(searchChannels) > 0 {
+			searchOpt, err = searchWindow.addThreads(ctx, stream.New(client, cfg.Limits), result.list, searchChannels)
+		} else {
+			err = ctx.Err()
+		}
+		if err != nil {
+			base.SetExitStatus(base.SApplicationError)
+			return err
+		}
 	}
 
 	// connecting to the database in read-write mode.
@@ -208,6 +264,9 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		stream.OptInclusive(false),
 		stream.OptIncludeOlderCanvasRoots(),
 	}
+	if searchOpt != nil {
+		streamOpts = append(streamOpts, searchOpt)
+	}
 	if resumeFlags.SkipCompleteThreads {
 		streamOpts = append(
 			streamOpts,
@@ -220,7 +279,7 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 		cmd.Name(),
 		wconn,
 		client,
-		dir,
+		archiveDir,
 		cf,
 		streamOpts,
 		archive.WithFileDeduplication(),
@@ -234,7 +293,7 @@ func runResume(ctx context.Context, cmd *base.Command, args []string) error {
 	}
 	defer ctrl.Close()
 
-	if err := runArchiveAndCleanup(ctx, ctrl, latestResult.list, wconn, dir, resumeFlags.Dedupe); err != nil {
+	if err := runArchiveAndCleanup(ctx, ctrl, result.list, wconn, dir, resumeFlags.Dedupe); err != nil {
 		if errors.Is(err, errRunArchiveController) {
 			base.SetExitStatus(base.SApplicationError)
 		}
@@ -290,80 +349,6 @@ func runDedupeAfterFinish(ctx context.Context, conn *sqlx.DB, dir string, enable
 		Database: dir,
 	})
 	return err
-}
-
-type latestResult struct {
-	list          *structures.EntityList
-	hasSourceData bool
-	skippedStale  int
-}
-
-func latest(ctx context.Context, src source.Resumer, includeThreads bool, skipCompleteThreads bool, lookBack time.Duration, threadCutoff, channelCutoff *time.Time, other *structures.EntityList) (latestResult, error) {
-	if lookBack > 0 {
-		lookBack = -lookBack
-	}
-	latest, err := src.Latest(ctx)
-	if err != nil {
-		return latestResult{}, fmt.Errorf("error loading latest timestamps: %w", err)
-	}
-	result := latestResult{
-		list:          &structures.EntityList{},
-		hasSourceData: len(latest) > 0,
-	}
-	if len(latest) == 0 && (other == nil || other.IsEmpty()) {
-		return result, nil
-	}
-
-	if cfg.Verbose {
-		strlatest(latest)
-	}
-
-	ei := make([]structures.EntityItem, 0, len(latest))
-	for sl, ts := range latest {
-		if sl.IsThread() && !includeThreads {
-			continue
-		}
-		if sl.IsThread() && threadCutoff != nil && ts.Before(*threadCutoff) {
-			result.skippedStale++
-			continue
-		}
-		if !sl.IsThread() && channelCutoff != nil && ts.Before(*channelCutoff) {
-			result.skippedStale++
-			continue
-		}
-		item := structures.EntityItem{
-			Id:      sl.String(),
-			Oldest:  ts.Add(lookBack),
-			Latest:  time.Time(cfg.Latest),
-			Include: true,
-		}
-		ei = append(ei, item)
-		debugprint(fmt.Sprintf("%s: %d->%d", item.Id, ts.UTC().UnixMicro(), item.Oldest.UnixMicro()))
-	}
-	el := structures.NewEntityListFromItems(ei...)
-	el.Overlay(other)
-	result.list = el
-
-	return result, nil
-}
-
-func debugprint(a ...any) {
-	if cfg.Verbose {
-		fmt.Println(a...)
-	}
-}
-
-func strlatest(l map[structures.SlackLink]time.Time) string {
-	var buf strings.Builder
-	tw := tabwriter.NewWriter(&buf, 0, 0, 1, ' ', 0)
-	fmt.Fprintln(tw, "Group ID\tLatest")
-	for gid, ts := range l {
-		fmt.Fprintf(tw, "%s\t%s\n", gid, ts.Format("2006-01-02 15:04:05 MST"))
-	}
-	if err := tw.Flush(); err != nil {
-		slog.Error("flushing went wrong", "error", err)
-	}
-	return buf.String()
 }
 
 func ensureSameWorkspace(ctx context.Context, src source.Sourcer, info *slackdump.WorkspaceInfo) error {

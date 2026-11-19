@@ -18,39 +18,44 @@ package fileproc
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/rusq/slack"
 
 	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
 	"github.com/rusq/slackdump/v4/processor"
+	"github.com/rusq/slackdump/v4/source"
 )
 
 // DeduplicatingFileProcessor wraps a FileProcessor and skips downloading
-// files that already exist in the database with the same ID and size.
+// files with matching database metadata and a complete local attachment.
 type DeduplicatingFileProcessor struct {
-	inner processor.Filer
-	db    *sqlx.DB
-	lg    *slog.Logger
-	r     repository.FileRepository
+	inner   processor.Filer
+	db      *sqlx.DB
+	dirname string
+	lg      *slog.Logger
+	r       repository.FileRepository
 }
 
 // NewDeduplicatingFileProcessor creates a new file processor that skips
-// downloading files that already exist in the database.
-func NewDeduplicatingFileProcessor(inner processor.Filer, db *sqlx.DB, lg *slog.Logger) *DeduplicatingFileProcessor {
+// downloading complete attachments already recorded in the database.
+func NewDeduplicatingFileProcessor(inner processor.Filer, db *sqlx.DB, dirname string, lg *slog.Logger) *DeduplicatingFileProcessor {
 	if lg == nil {
 		lg = slog.Default()
 	}
 	return &DeduplicatingFileProcessor{
-		inner: inner,
-		db:    db,
-		lg:    lg,
-		r:     repository.NewFileRepository(),
+		inner:   inner,
+		db:      db,
+		dirname: dirname,
+		lg:      lg,
+		r:       repository.NewFileRepository(),
 	}
 }
 
-// Files processes files, skipping those that already exist in the database
-// with the same ID and size.
+// Files processes files, skipping complete local attachments when the database
+// already has a matching ID and size.
 //
 // Files are processed one-by-one rather than batched, because:
 //   - Files arrive per-message, so we can't batch across all files (streaming)
@@ -76,11 +81,13 @@ func (d *DeduplicatingFileProcessor) Files(ctx context.Context, channel *slack.C
 		}
 
 		if existing != nil {
-			d.lg.DebugContext(ctx, "skipping duplicate file", "file_id", f.ID, "size", f.Size)
-			continue
+			info, err := os.Stat(filepath.Join(d.dirname, source.MattermostFilepath(channel, f)))
+			if err == nil && info.Mode().IsRegular() && (f.Size <= 0 || info.Size() == int64(f.Size)) {
+				d.lg.DebugContext(ctx, "skipping duplicate file", "file_id", f.ID, "size", f.Size)
+				continue
+			}
 		}
 
-		// File doesn't exist or size differs - download it
 		if err := d.inner.Files(ctx, channel, parent, []slack.File{*f}); err != nil {
 			return err
 		}

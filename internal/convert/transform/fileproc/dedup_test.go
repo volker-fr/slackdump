@@ -2,13 +2,20 @@ package fileproc
 
 import (
 	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/rusq/fsadapter"
 	"github.com/rusq/slack"
-	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
-	"github.com/rusq/slackdump/v4/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
+	"github.com/rusq/slackdump/v4/internal/testutil"
+	"github.com/rusq/slackdump/v4/source"
 )
 
 // mockFileProcessor tracks which files were "downloaded"
@@ -22,6 +29,17 @@ func (m *mockFileProcessor) Files(ctx context.Context, ch *slack.Channel, msg sl
 }
 
 func (m *mockFileProcessor) Close() error { return nil }
+
+type attachmentGetter struct {
+	contents string
+	urls     []string
+}
+
+func (g *attachmentGetter) GetFileContext(_ context.Context, url string, dst io.Writer) error {
+	g.urls = append(g.urls, url)
+	_, err := io.WriteString(dst, g.contents)
+	return err
+}
 
 func TestDeduplicatingFileProcessor_Files(t *testing.T) {
 	// Set up in-memory SQLite database with migrations
@@ -52,25 +70,48 @@ func TestDeduplicatingFileProcessor_Files(t *testing.T) {
 	mock := &mockFileProcessor{}
 
 	// Create deduplicating processor
-	dedup := NewDeduplicatingFileProcessor(mock, db, nil)
+	dirname := t.TempDir()
+	dir := fsadapter.NewDirectory(dirname)
+	dedup := NewDeduplicatingFileProcessor(mock, db, dirname, nil)
 
 	channel := &slack.Channel{}
 	parent := slack.Message{}
 
-	t.Run("existing file should be skipped", func(t *testing.T) {
-		mock.FilesCalled = nil
+	for _, tt := range []struct {
+		name     string
+		original string
+		download bool
+	}{
+		{name: "missing binary", download: true},
+		{name: "short binary", original: "short", download: true},
+		{name: "complete binary", original: strings.Repeat("c", 1000)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			archiveDir := t.TempDir()
+			storage := fsadapter.NewDirectory(archiveDir)
+			file := slack.File{ID: "F1", Name: "resume:report.txt", Size: 1000, URLPrivateDownload: "https://example.invalid/report"}
+			path := source.MattermostFilepath(channel, &file)
+			if tt.original != "" {
+				require.NoError(t, storage.WriteFile(path, []byte(tt.original), 0o600))
+			}
 
-		// File that already exists in DB
-		files := []slack.File{
-			{ID: "F1", Size: 1000},
-		}
-
-		err := dedup.Files(context.Background(), channel, parent, files)
-		require.NoError(t, err)
-
-		// Should NOT have called inner.Files (file was skipped)
-		assert.Len(t, mock.FilesCalled, 0, "existing file should be skipped")
-	})
+			getter := &attachmentGetter{contents: strings.Repeat("d", file.Size)}
+			dl := NewDownloader(t.Context(), true, getter, storage, nil)
+			dedup := NewDeduplicatingFileProcessor(New(dl), db, archiveDir, nil)
+			t.Cleanup(func() { dedup.Close() })
+			require.NoError(t, dedup.Files(t.Context(), channel, parent, []slack.File{file}))
+			require.NoError(t, dedup.Close())
+			got, err := os.ReadFile(filepath.Join(archiveDir, path))
+			require.NoError(t, err)
+			if tt.download {
+				assert.Equal(t, []string{file.URLPrivateDownload}, getter.urls)
+				assert.Equal(t, getter.contents, string(got))
+			} else {
+				assert.Empty(t, getter.urls)
+				assert.Equal(t, tt.original, string(got))
+			}
+		})
+	}
 
 	t.Run("new file should be downloaded", func(t *testing.T) {
 		mock.FilesCalled = nil
@@ -95,6 +136,7 @@ func TestDeduplicatingFileProcessor_Files(t *testing.T) {
 		files := []slack.File{
 			{ID: "F1", Size: 2000, Name: "test1-updated.txt"},
 		}
+		require.NoError(t, dir.WriteFile(source.MattermostFilepath(channel, &files[0]), make([]byte, files[0].Size), 0o600))
 
 		err := dedup.Files(context.Background(), channel, parent, files)
 		require.NoError(t, err)
@@ -124,9 +166,12 @@ func TestDeduplicatingFileProcessor_Files(t *testing.T) {
 		mock.FilesCalled = nil
 
 		files := []slack.File{
-			{ID: "F1", Size: 1000},                // exists, skip
-			{ID: "NEW3", Size: 300, Name: "new3"}, // new, download
-			{ID: "F3", Size: 500},                 // exists, skip
+			{ID: "F1", Size: 1000, Name: "test1.txt"}, // exists, skip
+			{ID: "NEW3", Size: 300, Name: "new3"},     // new, download
+			{ID: "F3", Size: 500, Name: "test3.txt"},  // exists, skip
+		}
+		for _, f := range []slack.File{files[0], files[2]} {
+			require.NoError(t, dir.WriteFile(source.MattermostFilepath(channel, &f), make([]byte, f.Size), 0o600))
 		}
 
 		err := dedup.Files(context.Background(), channel, parent, files)

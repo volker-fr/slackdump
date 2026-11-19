@@ -17,6 +17,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/trace"
 	"sync"
@@ -48,7 +49,8 @@ func (cs *Stream) SearchMessages(ctx context.Context, proc processor.MessageSear
 			defer close(channelInfoC)
 			// defer close(channelUsersC)
 
-			if err := cs.searchmsg(ctx, query, func(sm []slack.SearchMessage) error {
+			if err := cs.SearchMessagePages(ctx, query, func(_ string, page *slack.SearchMessages) error {
+				sm := page.Matches
 				if err := proc.SearchMessages(ctx, query, sm); err != nil {
 					return err
 				}
@@ -102,7 +104,9 @@ func (cs *Stream) SearchMessages(ctx context.Context, proc processor.MessageSear
 	return nil
 }
 
-func (cs *Stream) searchmsg(ctx context.Context, query string, fn func(sm []slack.SearchMessage) error) error {
+// SearchMessagePages calls fn with the request cursor and each raw search
+// response. It does not fetch channel metadata or invoke result callbacks.
+func (cs *Stream) SearchMessagePages(ctx context.Context, query string, fn func(cursor string, page *slack.SearchMessages) error) error {
 	ctx, task := trace.NewTask(ctx, "searchmsg")
 	defer task.End()
 
@@ -125,7 +129,10 @@ func (cs *Stream) searchmsg(ctx context.Context, query string, fn func(sm []slac
 		}); err != nil {
 			return err
 		}
-		if err := fn(sm.Matches); err != nil {
+		if sm == nil {
+			return errors.New("search.messages returned no response")
+		}
+		if err := fn(p.Cursor, sm); err != nil {
 			return err
 		}
 		if sm.NextCursor == "" {

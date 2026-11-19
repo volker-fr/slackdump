@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/trace"
 	"time"
 
@@ -48,6 +49,8 @@ type Stream struct {
 	skipThread              func(ctx context.Context, channelID, threadTS string, replyCount int) bool
 	skipCanvasThread        func(ctx context.Context, channelID, threadTS string, replyCount int) bool
 	includeOlderCanvasRoots bool
+	searchHistoryChannels   map[string]struct{}
+	searchThreadRoots       map[structures.SlackLink]struct{}
 }
 
 // ResultType helps to identify the type of the result, so that the callback
@@ -196,6 +199,16 @@ func OptSkipCanvasThreadFunc(fn func(ctx context.Context, channelID, threadTS st
 func OptIncludeOlderCanvasRoots() Option {
 	return func(cs *Stream) {
 		cs.includeOlderCanvasRoots = true
+	}
+}
+
+// OptSearchThreadResume suppresses ordinary history-derived thread requests
+// for the given channels and requires complete replies fetches for the given
+// direct thread roots. Canvas discussions are unaffected.
+func OptSearchThreadResume(channels map[string]struct{}, roots map[structures.SlackLink]struct{}) Option {
+	return func(cs *Stream) {
+		cs.searchHistoryChannels = maps.Clone(channels)
+		cs.searchThreadRoots = maps.Clone(roots)
 	}
 }
 

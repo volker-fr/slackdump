@@ -54,9 +54,41 @@ each day, use `slackdump resume`:
 slackdump resume /backups/myworkspace
 ```
 
-Resume reads the existing database to determine where each channel left off and
-only fetches messages newer than the last recorded timestamp. This is far
-faster than re-archiving from scratch.
+Resume reads the existing database to determine where each channel left off.
+It fetches new messages with a lookback window that can include already
+archived messages.
+
+Slack search can discover recent thread activity, including replies to older
+parents.
+
+```bash
+slackdump resume --search-thread /backups/myworkspace
+slackdump resume --search-thread -lookback p28d /backups/myworkspace
+```
+
+The search start is inclusive. If you omit `-time-from`, Slackdump uses the
+earliest resume start among the channels left after exclusions and stale-channel
+filtering. For an archived channel, the resume start is the timestamp of its
+latest message from a completed history fetch, minus `-lookback` (seven days by
+default). A channel specified on the command line replaces its archived start
+with the supplied date, if any. Undated channels share the search window. If
+the scope has channels but none has a date, supply `-time-from`. The end is
+exclusive and defaults to the time Slackdump started.
+
+Use overlapping windows for ongoing backups and replay the same explicit bounds
+after a failure.
+
+```bash
+slackdump resume --search-thread -time-from 2026-11-12T00:00:00 \
+  -time-to 2026-11-19T00:00:00 /backups/myworkspace
+```
+
+This mode takes precedence over `-threads` in the search scope. Channel history,
+canvas discussions, and explicit thread links keep their normal processing.
+Channel history uses `-time-from` as a fallback for channels without their own
+start. Channels added by `-refresh` outside the search scope use ordinary
+history-based thread discovery. Search depends on Slack indexing, visibility,
+and retention.
 
 See the [Troubleshooting](troubleshooting.md#resume--incremental-backups) page
 if resume hangs or is unexpectedly slow.

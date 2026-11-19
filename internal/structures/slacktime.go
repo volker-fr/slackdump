@@ -60,6 +60,18 @@ func ParseSlackTS(timestamp string) (time.Time, error) {
 	return time.UnixMicro(t).UTC(), nil
 }
 
+// ParseCanonicalSlackTS parses a Slack timestamp with six fractional digits.
+func ParseCanonicalSlackTS(timestamp string) (time.Time, error) {
+	t, err := ParseSlackTS(timestamp)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if FormatSlackTS(t) != timestamp {
+		return time.Time{}, fmt.Errorf("invalid Slack timestamp %q", timestamp)
+	}
+	return t, nil
+}
+
 func FormatSlackTS(ts time.Time) string {
 	if ts.IsZero() || ts.Before(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)) {
 		return ""

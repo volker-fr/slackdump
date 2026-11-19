@@ -12,6 +12,11 @@ replies on older messages. That overlap can record the same payload in more
 than one session. `dedupe` removes the older identical copies, keeps the
 latest copy, and prunes chunks that become empty as a result.
 
+To preserve the channel list and cutoffs for `slackdump resume`, dedupe keeps
+final channel-history pages and at least one history page per channel. It
+also keeps the newest history message from a finished session that reached
+the channel's final page, even when there is a newer copy of that message.
+
 ## Usage
 
 ```bash
@@ -33,7 +38,7 @@ point the command at the database file itself.
 | Flag | Description |
 |------|-------------|
 | `-execute` | Required flag to actually remove duplicate entities |
-| `-mode` | Message dedupe mode: `exact` keeps current byte-for-byte behavior; `message-key` keeps the latest row per channel and timestamp |
+| `-mode` | Message dedupe mode: `exact` compares full payloads, while `message-key` compares channel and timestamp |
 
 `message-key` is useful after merging multiple Slack exports of the same
 workspace when duplicate messages differ only in volatile Slack-generated JSON

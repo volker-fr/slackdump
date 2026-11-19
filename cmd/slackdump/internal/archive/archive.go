@@ -198,8 +198,8 @@ func WithDatabaseOptions(opts ...dbase.Option) DBControllerOption {
 	}
 }
 
-// WithFileDeduplication skips downloading files already present in the
-// database.
+// WithFileDeduplication skips downloading complete attachments already
+// recorded in the database.
 func WithFileDeduplication() DBControllerOption {
 	return func(o *dbControllerOptions) {
 		o.fileDeduplicate = true
@@ -246,7 +246,7 @@ func DBController(ctx context.Context, sessionName string, conn *sqlx.DB, client
 		lg,
 	)
 
-	filer := dbControllerFiler(dl, conn, lg, options)
+	filer := dbControllerFiler(dl, conn, dirname, lg, options)
 
 	ctrl, err := control.New(
 		ctx,
@@ -262,10 +262,10 @@ func DBController(ctx context.Context, sessionName string, conn *sqlx.DB, client
 	return ctrl, nil
 }
 
-func dbControllerFiler(dl fileproc.Downloader, conn *sqlx.DB, lg *slog.Logger, options dbControllerOptions) processor.Filer {
+func dbControllerFiler(dl fileproc.Downloader, conn *sqlx.DB, dirname string, lg *slog.Logger, options dbControllerOptions) processor.Filer {
 	filer := fileproc.New(dl)
 	if options.fileDeduplicate {
-		return fileproc.NewDeduplicatingFileProcessor(filer, conn, lg)
+		return fileproc.NewDeduplicatingFileProcessor(filer, conn, dirname, lg)
 	}
 	return filer
 }

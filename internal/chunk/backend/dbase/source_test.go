@@ -959,6 +959,111 @@ func TestSource_AliasLifecycle(t *testing.T) {
 	}
 }
 
+func TestSource_ResumeChannelHistory(t *testing.T) {
+	page := func(t *testing.T, db *DBP, channelID, timestamp string, kind chunk.ChunkType, final bool) int64 {
+		t.Helper()
+		p := chunk.Chunk{Type: kind, ChannelID: channelID, IsLast: final}
+		if timestamp != "" {
+			p.Messages = []slack.Message{{Msg: slack.Msg{Timestamp: timestamp}}}
+			p.Count = 1
+		}
+		id, err := db.InsertChunk(t.Context(), &p)
+		require.NoError(t, err)
+		return id
+	}
+
+	t.Run("after dedupe", func(t *testing.T) {
+		for _, mode := range []repository.MessageDedupeMode{repository.MessageDedupeExact, repository.MessageDedupeKey} {
+			t.Run(string(mode), func(t *testing.T) {
+				ctx, conn := t.Context(), testDB(t)
+				finished, err := New(ctx, conn, SessionInfo{})
+				require.NoError(t, err)
+				unfinished, err := New(ctx, conn, SessionInfo{})
+				require.NoError(t, err)
+
+				const newest = "1700000000.000001"
+				const terminal = "1700000000.000000"
+				page(t, finished, "CBOUNDED", newest, chunk.CMessages, false)
+				cutoffChunk := page(t, finished, "CBOUNDED", newest, chunk.CMessages, false)
+				finalChunk := page(t, finished, "CBOUNDED", terminal, chunk.CMessages, true)
+				page(t, unfinished, "CBOUNDED", newest, chunk.CMessages, false)
+				page(t, unfinished, "CBOUNDED", terminal, chunk.CMessages, false)
+				page(t, unfinished, "CBOUNDED", "1700000000.000002", chunk.CMessages, false)
+
+				page(t, finished, "CCANVASOVERLAP", newest, chunk.CMessages, true)
+				page(t, unfinished, "CCANVASOVERLAP", newest, chunk.CCanvasMessages, true)
+				page(t, finished, "CEMPTY", "", chunk.CMessages, true)
+
+				page(t, unfinished, "CUNFINISHED", newest, chunk.CMessages, false)
+				scopeChunk := page(t, unfinished, "CUNFINISHED", newest, chunk.CMessages, false)
+				page(t, unfinished, "CUNFINISHED", newest, chunk.CThreadMessages, true)
+				require.NoError(t, finished.Finish())
+				require.NoError(t, unfinished.Close())
+
+				src := &Source{conn: conn}
+				before, err := src.ResumeChannelHistory(ctx)
+				require.NoError(t, err)
+				require.Len(t, before, 4)
+				require.Equal(t, newest, structures.FormatSlackTS(before["CBOUNDED"]))
+				require.Equal(t, newest, structures.FormatSlackTS(before["CCANVASOVERLAP"]))
+				require.Contains(t, before, "CUNFINISHED")
+				require.True(t, before["CUNFINISHED"].IsZero())
+
+				repo := repository.NewDedupeRepository(repository.WithMessageDedupeMode(mode))
+				preview, err := repo.Preview(ctx, conn)
+				require.NoError(t, err)
+				removed, err := repo.Deduplicate(ctx, conn)
+				require.NoError(t, err)
+				after, err := src.ResumeChannelHistory(ctx)
+				require.NoError(t, err)
+				assert.Len(t, after, len(before))
+				for channelID, stamp := range before {
+					got, ok := after[channelID]
+					assert.True(t, ok, "missing channel %s", channelID)
+					assert.True(t, stamp.Equal(got), "%s: got %s, want %s", channelID, got, stamp)
+				}
+				assert.Equal(t, repository.DedupeStats{Messages: 4, Chunks: 2}, removed)
+				assert.Equal(t, preview, removed)
+
+				var remaining int
+				require.NoError(t, conn.Get(&remaining, `SELECT COUNT(*) FROM MESSAGE WHERE CHUNK_ID = ?`, cutoffChunk))
+				assert.Equal(t, 1, remaining)
+				for _, id := range []int64{finalChunk, scopeChunk} {
+					require.NoError(t, conn.Get(&remaining, `SELECT COUNT(*) FROM MESSAGE WHERE CHUNK_ID = ?`, id))
+					assert.Zero(t, remaining)
+				}
+			})
+		}
+	})
+
+	ctx, conn := t.Context(), testDB(t)
+	finished, err := New(ctx, conn, SessionInfo{})
+	require.NoError(t, err)
+	unfinished, err := New(ctx, conn, SessionInfo{})
+	require.NoError(t, err)
+
+	page(t, finished, "CBOUNDED", "1700000000.000001", chunk.CMessages, false)
+	page(t, finished, "CBOUNDED", "1700000000.000000", chunk.CMessages, true)
+	page(t, finished, "CEMPTY", "", chunk.CMessages, true)
+	page(t, finished, "CNOFINAL", "1710000000.000003", chunk.CMessages, false)
+	page(t, finished, "CHIDDEN", "1720000000.000004", chunk.CCanvasMessages, true)
+	page(t, unfinished, "CBOUNDED", "1730000000.000005", chunk.CMessages, true)
+	page(t, unfinished, "CUNFINISHED", "1740000000.000006", chunk.CMessages, true)
+	require.NoError(t, finished.Finish())
+	require.NoError(t, unfinished.Close())
+
+	src := &Source{conn: conn}
+	got, err := src.ResumeChannelHistory(ctx)
+	require.NoError(t, err)
+	assert.Len(t, got, 4)
+	assert.Equal(t, "1700000000.000001", structures.FormatSlackTS(got["CBOUNDED"]))
+	for _, channel := range []string{"CEMPTY", "CNOFINAL", "CUNFINISHED"} {
+		stamp, ok := got[channel]
+		assert.True(t, ok, channel)
+		assert.True(t, stamp.IsZero(), channel)
+	}
+}
+
 func TestSource_Latest(t *testing.T) {
 	type fields struct {
 		conn     *sqlx.DB
