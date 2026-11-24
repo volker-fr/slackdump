@@ -423,21 +423,45 @@ func (s *Source) Latest(ctx context.Context) (map[structures.SlackLink]time.Time
 // and unfinished channels. A nonzero timestamp is backed by a finished
 // session in which the channel's history reached its final page.
 func (s *Source) ResumeChannelHistory(ctx context.Context) (map[string]time.Time, error) {
+	// Skip the message index when a channel has no completed history.
+	// Otherwise, walk the index from newest to oldest until a message qualifies.
 	const stmt = `
 WITH HISTORY AS (
-    SELECT DISTINCT CHANNEL_ID FROM CHUNK WHERE TYPE_ID = ? AND CHANNEL_ID IS NOT NULL
-), COMPLETE AS (
-    SELECT DISTINCT C.CHANNEL_ID, C.SESSION_ID
-    FROM CHUNK C JOIN SESSION S ON S.ID = C.SESSION_ID
-    WHERE C.TYPE_ID = ? AND C.FINAL AND S.FINISHED
+    SELECT DISTINCT CHANNEL_ID
+    FROM CHUNK
+    WHERE TYPE_ID = ?1 AND CHANNEL_ID IS NOT NULL
 )
-SELECT H.CHANNEL_ID, MAX(M.ID)
-FROM HISTORY H
-LEFT JOIN COMPLETE F ON F.CHANNEL_ID = H.CHANNEL_ID
-LEFT JOIN CHUNK C ON C.CHANNEL_ID = F.CHANNEL_ID AND C.SESSION_ID = F.SESSION_ID AND C.TYPE_ID = ?
-LEFT JOIN MESSAGE M ON M.CHUNK_ID = C.ID AND M.CHANNEL_ID = C.CHANNEL_ID
-GROUP BY H.CHANNEL_ID`
-	rows, err := s.conn.QueryContext(ctx, stmt, chunk.CMessages, chunk.CMessages, chunk.CMessages)
+SELECT H.CHANNEL_ID,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM CHUNK F
+        JOIN SESSION S ON S.ID = F.SESSION_ID
+        WHERE F.CHANNEL_ID = H.CHANNEL_ID
+          AND F.TYPE_ID = ?1
+          AND F.FINAL
+          AND S.FINISHED
+    ) THEN (
+        SELECT M.ID
+        FROM MESSAGE M INDEXED BY MESSAGE_DEDUPE_IDX
+        JOIN CHUNK C ON C.ID = M.CHUNK_ID
+        JOIN SESSION S ON S.ID = C.SESSION_ID
+        WHERE M.CHANNEL_ID = H.CHANNEL_ID
+          AND C.CHANNEL_ID = H.CHANNEL_ID
+          AND C.TYPE_ID = ?1
+          AND S.FINISHED
+          AND EXISTS (
+              SELECT 1
+              FROM CHUNK F
+              WHERE F.CHANNEL_ID = C.CHANNEL_ID
+                AND F.SESSION_ID = C.SESSION_ID
+                AND F.TYPE_ID = C.TYPE_ID
+                AND F.FINAL
+          )
+        ORDER BY M.ID DESC
+        LIMIT 1
+    ) END
+FROM HISTORY H`
+	rows, err := s.conn.QueryContext(ctx, stmt, chunk.CMessages)
 	if err != nil {
 		return nil, err
 	}
