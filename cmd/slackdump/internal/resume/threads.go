@@ -303,7 +303,10 @@ func (w searchThreadWindow) addThreads(ctx context.Context, s *stream.Stream, li
 				pending[root] = parentTS
 			}
 			if page.NextCursor == "" && rawMatches < total {
-				return fmt.Errorf("search returned %d of %d reported matches", rawMatches, total)
+				// The reason is unclear. Slack might still count a deleted message in its search cache.
+				cfg.Log.WarnContext(ctx, fmt.Sprintf(
+					"Slack search returned fewer matches than reported (%d out of %d results missing). Missing hits can belong to threads already identified.",
+					total-rawMatches, total), "from", from, "to", to, "total", total, "raw_matches", rawMatches)
 			}
 			return nil
 		})

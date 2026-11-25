@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -379,6 +380,36 @@ func Test_searchThreadWindow_addThreads(t *testing.T) {
 		assert.Equal(t, after, structures.FormatSlackTS(root.Latest))
 	})
 
+	t.Run("short search warns and keeps discovered roots", func(t *testing.T) {
+		list, err := structures.NewEntityList([]string{"CKNOWN"})
+		require.NoError(t, err)
+		var logs bytes.Buffer
+		prevLog := cfg.Log
+		t.Cleanup(func() { cfg.Log = prevLog })
+		cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+
+		var calls int
+		api := testResumeClient(func(method string, args url.Values) (jsonObject, error) {
+			assert.Equal(t, "search.messages", method)
+			assert.Equal(t, fullQuery, args.Get("query"))
+			assert.Equal(t, "*", args.Get("cursor"))
+			calls++
+			page := searchPage("", 1, searchHit("CKNOWN", old, lower))
+			page["messages"].(jsonObject)["paging"] = jsonObject{"total": 3}
+			page["messages"].(jsonObject)["pagination"] = jsonObject{"total_count": 2}
+			return page, nil
+		})
+		opt, err := w.addThreads(t.Context(), stream.New(api, network.NoLimits), list, channels)
+		require.NoError(t, err)
+		assert.NotNil(t, opt)
+		assert.Equal(t, 1, calls)
+		assert.Equal(t, 2, list.IncludeCount())
+		_, ok := list.Get("CKNOWN:" + old)
+		assert.True(t, ok)
+		assert.Contains(t, logs.String(), `level=WARN msg="Slack search returned fewer matches than reported (2 out of 3 results missing). Missing hits can belong to threads already identified."`)
+		assert.Contains(t, logs.String(), "from=2026-11-01T01:02:03.000Z to=2026-11-08T18:00:00.000Z total=3 raw_matches=1")
+	})
+
 	for _, tc := range []struct {
 		name    string
 		handler func(url.Values) jsonObject
@@ -386,13 +417,6 @@ func Test_searchThreadWindow_addThreads(t *testing.T) {
 	}{
 		{"repeated cursor", func(url.Values) jsonObject { return searchPage("same", 0) }, "repeated search cursor"},
 		{"repeated cursor at cap", func(url.Values) jsonObject { return searchPage("*", 10_000) }, "repeated search cursor"},
-		{"short search", func(url.Values) jsonObject { return searchPage("", 2) }, "0 of 2"},
-		{"short search uses the highest first-page total", func(url.Values) jsonObject {
-			page := searchPage("", 1)
-			page["messages"].(jsonObject)["paging"] = jsonObject{"total": 3}
-			page["messages"].(jsonObject)["pagination"] = jsonObject{"total_count": 2}
-			return page
-		}, "0 of 3"},
 		{"Slack error", func(url.Values) jsonObject { return jsonObject{"ok": false, "error": "invalid_auth"} }, "invalid_auth"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
