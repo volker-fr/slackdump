@@ -16,15 +16,9 @@
 package stream
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"net/http"
-	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -36,7 +30,6 @@ import (
 
 	"github.com/rusq/slackdump/v4/internal/client"
 	"github.com/rusq/slackdump/v4/internal/client/mock_client"
-	"github.com/rusq/slackdump/v4/internal/edge"
 	"github.com/rusq/slackdump/v4/internal/fixtures"
 	"github.com/rusq/slackdump/v4/internal/network"
 	"github.com/rusq/slackdump/v4/internal/structures"
@@ -64,90 +57,6 @@ func (c *canvasSlack) CanvasSupported() bool {
 func (c *canvasSlack) CanvasThreadRoots(context.Context, string) ([]slack.Message, error) {
 	c.calls++
 	return c.roots, c.err
-}
-
-type canvasMissingMetadataTransport struct{}
-
-func (canvasMissingMetadataTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	var body string
-	switch req.URL.Path {
-	case "/api/quip.lookupThreadIds":
-		body = `{"ok":true,"lookup":{"FCANVAS":"OYP123"}}`
-	case "/canvas/collab/controller-init":
-		body = `{"user_id":"U123"}`
-	case "/canvas/-/load-data/editor/1":
-		// An empty response has no thread metadata table.
-	default:
-		return nil, fmt.Errorf("unexpected canvas request: %s", req.URL.Path)
-	}
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(body)),
-	}, nil
-}
-
-func Test_logCanvasAPIError(t *testing.T) {
-	canvasClient, err := edge.NewWithClient("test", "T123", "xoxc-test", &http.Client{Transport: canvasMissingMetadataTransport{}})
-	require.NoError(t, err)
-	_, missingMetadata := canvasClient.CanvasThreadRoots(t.Context(), "FCANVAS")
-	require.Error(t, missingMetadata)
-	missingMetadata = newAPIError("canvas.threadRoots", missingMetadata)
-	require.True(t, edge.IsCanvasMissingThreadMetadata(missingMetadata), "real discovery and stream wrappers must preserve the sentinel")
-
-	previousLogger := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(previousLogger) })
-	for _, tt := range []struct {
-		name    string
-		err     error
-		missing bool
-	}{
-		{"wrapped missing metadata", missingMetadata, true},
-		{"unknown API error", newAPIError("canvas.threadRoots", errors.New("unexpected response")), false},
-		{"same error text", errors.New(missingMetadata.Error()), false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			for _, level := range []slog.Level{slog.LevelInfo, slog.LevelDebug} {
-				t.Run(level.String(), func(t *testing.T) {
-					var output bytes.Buffer
-					slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: level})))
-					logCanvasAPIError(t.Context(), "canvas discussions unavailable", "COWNER", "FCANVAS", "CCANVAS", "123.456", tt.err)
-
-					var records []map[string]any
-					decoder := json.NewDecoder(&output)
-					for decoder.More() {
-						var record map[string]any
-						require.NoError(t, decoder.Decode(&record))
-						records = append(records, record)
-					}
-					wantRecords := 1
-					if tt.missing && level == slog.LevelDebug {
-						wantRecords++
-					}
-					require.Len(t, records, wantRecords)
-					for _, record := range records {
-						assert.Equal(t, "COWNER", record["owner_channel_id"])
-						assert.Equal(t, "FCANVAS", record["canvas_file_id"])
-						assert.Equal(t, "CCANVAS", record["canvas_channel_id"])
-						assert.Equal(t, "123.456", record["thread_ts"])
-					}
-					assert.Equal(t, "WARN", records[0]["level"])
-					if tt.missing {
-						assert.Equal(t, "canvas discussions unavailable: missing thread metadata", records[0]["msg"])
-						assert.NotContains(t, records[0], "err")
-						if level == slog.LevelDebug {
-							assert.Equal(t, "DEBUG", records[1]["level"])
-							assert.Equal(t, "canvas discussions unavailable", records[1]["msg"])
-							assert.Equal(t, tt.err.Error(), records[1]["err"])
-						}
-					} else {
-						assert.Equal(t, "canvas discussions unavailable", records[0]["msg"])
-						assert.Equal(t, tt.err.Error(), records[0]["err"])
-					}
-				})
-			}
-		})
-	}
 }
 
 func TestStream_channelWorker(t *testing.T) {

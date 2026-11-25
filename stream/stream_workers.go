@@ -26,7 +26,6 @@ import (
 	"github.com/rusq/slack"
 
 	"github.com/rusq/slackdump/v4/internal/client"
-	"github.com/rusq/slackdump/v4/internal/edge"
 	"github.com/rusq/slackdump/v4/internal/network"
 	"github.com/rusq/slackdump/v4/internal/structures"
 	"github.com/rusq/slackdump/v4/processor"
@@ -506,16 +505,11 @@ func canvasErrorIsFatal(err error) bool {
 }
 
 func logCanvasAPIError(ctx context.Context, message, ownerChannelID, fileID, hiddenChannelID, threadTS string, err error) {
-	logger := slog.With(
+	slog.WarnContext(ctx, message,
 		"owner_channel_id", ownerChannelID,
 		"canvas_file_id", fileID,
 		"canvas_channel_id", hiddenChannelID,
 		"thread_ts", threadTS,
+		"err", err,
 	)
-	if edge.IsCanvasMissingThreadMetadata(err) {
-		logger.WarnContext(ctx, "canvas discussions unavailable: missing thread metadata")
-		logger.DebugContext(ctx, message, "err", err)
-		return
-	}
-	logger.WarnContext(ctx, message, "err", err)
 }
