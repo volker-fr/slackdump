@@ -45,6 +45,12 @@ var (
 	errCanvasMissingThreadTable = errors.New("canvas editor/1: missing thread metadata table")
 )
 
+// IsCanvasMissingThreadMetadata reports whether err indicates that canvas
+// comment discovery could not find the thread metadata table.
+func IsCanvasMissingThreadMetadata(err error) bool {
+	return errors.Is(err, errCanvasMissingThreadTable)
+}
+
 // CanvasDocumentComment holds the document_comment subfields of a canvas message.
 type CanvasDocumentComment struct {
 	ThreadID string   `json:"thread_id"`
